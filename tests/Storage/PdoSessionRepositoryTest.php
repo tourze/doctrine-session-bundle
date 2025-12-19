@@ -5,57 +5,98 @@ declare(strict_types=1);
 namespace Tourze\DoctrineSessionBundle\Tests\Storage;
 
 use Doctrine\DBAL\Connection;
-use Doctrine\DBAL\Result;
-use Doctrine\DBAL\Statement;
+use Doctrine\DBAL\Platforms\SQLitePlatform;
 use PHPUnit\Framework\Attributes\CoversClass;
-use PHPUnit\Framework\MockObject\MockObject;
-use PHPUnit\Framework\TestCase;
-use Psr\Log\LoggerInterface;
+use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
 use Psr\SimpleCache\CacheInterface;
 use Tourze\DoctrineSessionBundle\Storage\PdoSessionRepository;
 use Tourze\DoctrineSessionBundle\Storage\SessionRepositoryInterface;
+use Tourze\PHPUnitSymfonyKernelTest\AbstractIntegrationTestCase;
 
 /**
  * @internal
- *
- * 注意：此测试类继承 TestCase 而非 AbstractIntegrationTestCase
- * 原因：需要完全控制所有依赖的 Mock 行为来测试边界条件和错误处理
- * 集成测试框架无法在运行时替换已初始化的服务（Connection, Cache等）
  */
-/** @phpstan-ignore-next-line */
 #[CoversClass(PdoSessionRepository::class)]
-final class PdoSessionRepositoryTest extends TestCase
+#[RunTestsInSeparateProcesses]
+final class PdoSessionRepositoryTest extends AbstractIntegrationTestCase
 {
+    private Connection $connection;
+
     private PdoSessionRepository $repository;
 
-    private Connection&MockObject $connection;
+    private CacheInterface $cache;
 
-    private LoggerInterface&MockObject $logger;
-
-    private CacheInterface&MockObject $cache;
-
-    private Statement&MockObject $statement;
-
-    private Result&MockObject $result;
-
-    protected function setUp(): void
+    protected function onSetUp(): void
     {
-        parent::setUp();
+        // 从容器获取数据库连接
+        $connection = self::getContainer()->get('doctrine.dbal.doctrine_session_connection');
+        $this->assertInstanceOf(Connection::class, $connection);
+        $this->connection = $connection;
 
-        // 创建 Mock 依赖
-        $this->connection = $this->createMock(Connection::class);
-        $this->logger = $this->createMock(LoggerInterface::class);
-        $this->cache = $this->createMock(CacheInterface::class);
-        $this->statement = $this->createMock(Statement::class);
-        $this->result = $this->createMock(Result::class);
+        // 从容器获取 PSR-16 缓存服务
+        $cache = self::getContainer()->get(CacheInterface::class);
+        $this->assertInstanceOf(CacheInterface::class, $cache);
+        $this->cache = $cache;
 
-        // 创建 PdoSessionRepository 实例（单元测试中直接实例化是允许的）
-        $this->repository = new PdoSessionRepository(
-            $this->connection,
-            $this->logger,
-            $this->cache,
-            'sessions',
-            3600
+        // 从容器获取 Repository 服务
+        $repository = self::getService(SessionRepositoryInterface::class);
+        $this->assertInstanceOf(PdoSessionRepository::class, $repository);
+        $this->repository = $repository;
+
+        // 确保数据库表存在
+        $this->createSessionsTableIfNotExists();
+
+        // 清理测试数据和缓存
+        $this->connection->executeStatement('DELETE FROM sessions');
+        $this->cache->clear();
+    }
+
+    protected function onTearDown(): void
+    {
+        // 清理测试数据和缓存
+        $this->connection->executeStatement('DELETE FROM sessions');
+        $this->cache->clear();
+    }
+
+    /**
+     * 创建 sessions 表（如果不存在）.
+     */
+    private function createSessionsTableIfNotExists(): void
+    {
+        $platform = $this->connection->getDatabasePlatform();
+
+        if ($platform instanceof SQLitePlatform) {
+            $sql = '
+                CREATE TABLE IF NOT EXISTS sessions (
+                    sess_id TEXT PRIMARY KEY,
+                    sess_data TEXT NOT NULL,
+                    sess_lifetime INTEGER NOT NULL,
+                    sess_time INTEGER NOT NULL
+                )
+            ';
+        } else {
+            $sql = '
+                CREATE TABLE IF NOT EXISTS sessions (
+                    sess_id VARBINARY(128) NOT NULL PRIMARY KEY,
+                    sess_data BLOB NOT NULL,
+                    sess_lifetime INTEGER UNSIGNED NOT NULL,
+                    sess_time INTEGER UNSIGNED NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+            ';
+        }
+
+        $this->connection->executeStatement($sql);
+    }
+
+    /**
+     * 插入测试会话数据到数据库.
+     */
+    private function insertTestSession(string $sessionId, string $data, int $time, int $lifetime = 3600): void
+    {
+        $encodedData = base64_encode($data);
+        $this->connection->executeStatement(
+            'INSERT INTO sessions (sess_id, sess_data, sess_lifetime, sess_time) VALUES (?, ?, ?, ?)',
+            [$sessionId, $encodedData, $lifetime, $time]
         );
     }
 
@@ -80,80 +121,44 @@ final class PdoSessionRepositoryTest extends TestCase
     }
 
     /**
-     * 测试读取会话数据 - 从缓存读取成功
+     * 测试读取会话数据 - 从数据库读取成功.
+     */
+    public function testReadShouldReturnDataFromDatabase(): void
+    {
+        // Arrange
+        $sessionId = 'test_session_id_'.uniqid();
+        $sessionData = 'test_session_data';
+        $this->insertTestSession($sessionId, $sessionData, time());
+
+        // Act
+        $result = $this->repository->read($sessionId);
+
+        // Assert
+        $this->assertSame($sessionData, $result);
+    }
+
+    /**
+     * 测试读取会话数据 - 从缓存读取成功.
      */
     public function testReadShouldReturnDataFromCacheWhenAvailable(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
-        $cachedData = 'cached_session_data';
+        $sessionId = 'test_session_id_'.uniqid();
+        $sessionData = 'cached_session_data';
 
-        $this->cache->expects(self::once())
-            ->method('get')
-            ->with('doctrine_session_'.$sessionId)
-            ->willReturn($cachedData)
-        ;
+        // 先写入数据库
+        $this->insertTestSession($sessionId, $sessionData, time());
 
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        // 第一次读取会从数据库读取并缓存
+        $firstRead = $this->repository->read($sessionId);
+        $this->assertSame($sessionData, $firstRead);
 
-        // Act
-        $result = $this->repository->read($sessionId);
+        // 删除数据库中的记录
+        $this->connection->executeStatement('DELETE FROM sessions WHERE sess_id = ?', [$sessionId]);
 
-        // Assert
-        $this->assertSame($cachedData, $result);
-    }
-
-    /**
-     * 测试读取会话数据 - 缓存失败，从数据库读取.
-     */
-    public function testReadShouldFallbackToDatabaseWhenCacheThrowsException(): void
-    {
-        // Arrange
-        $sessionId = 'test_session_id';
-        $dbData = base64_encode('database_session_data');
-        $expectedData = 'database_session_data';
-
-        $this->cache->expects(self::once())
-            ->method('get')
-            ->with('doctrine_session_'.$sessionId)
-            ->willThrowException(new \Exception('Cache error'))
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
-
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('SELECT sess_data FROM sessions'))
-            ->willReturn($this->statement)
-        ;
-
-        // 简化 bindValue 验证
-        $this->statement->expects(self::exactly(2))
-            ->method('bindValue')
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
-
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn($dbData)
-        ;
-
-        $this->cache->expects(self::once())
-            ->method('set')
-            ->with('doctrine_session_'.$sessionId, $expectedData, 3600)
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
-
-        // Act
-        $result = $this->repository->read($sessionId);
-
-        // Assert
-        $this->assertSame($expectedData, $result);
+        // 第二次读取应该从缓存获取
+        $secondRead = $this->repository->read($sessionId);
+        $this->assertSame($sessionData, $secondRead);
     }
 
     /**
@@ -162,29 +167,27 @@ final class PdoSessionRepositoryTest extends TestCase
     public function testReadShouldReturnEmptyStringWhenNotFoundInDatabase(): void
     {
         // Arrange
-        $sessionId = 'non_existent_session';
+        $sessionId = 'non_existent_session_'.uniqid();
 
-        $this->cache->expects(self::once())
-            ->method('get')
-            ->willReturn(null)
-        ;
+        // Act
+        $result = $this->repository->read($sessionId);
 
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->willReturn($this->statement)
-        ;
+        // Assert
+        $this->assertSame('', $result);
+    }
 
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
+    /**
+     * 测试读取会话数据 - 会话已过期.
+     */
+    public function testReadShouldReturnEmptyStringForExpiredSession(): void
+    {
+        // Arrange
+        $sessionId = 'expired_session_'.uniqid();
+        $sessionData = 'expired_data';
+        // 默认 TTL 是 86400 秒（24小时），必须超过这个时间才算过期
+        $expiredTime = time() - 86401; // 超过24小时前
 
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn(false)
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        $this->insertTestSession($sessionId, $sessionData, $expiredTime);
 
         // Act
         $result = $this->repository->read($sessionId);
@@ -206,75 +209,56 @@ final class PdoSessionRepositoryTest extends TestCase
     }
 
     /**
-     * 测试写入会话数据 - 成功写入.
+     * 测试写入会话数据 - 成功写入新会话.
      */
-    public function testWriteShouldWriteToDatabase(): void
+    public function testWriteShouldWriteNewSessionToDatabase(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
-        $sessionData = 'test_session_data';
-
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('INSERT INTO sessions'))
-            ->willReturn($this->statement)
-        ;
-
-        // 简化 bindValue 验证
-        $this->statement->expects(self::exactly(4))
-            ->method('bindValue')
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeStatement')
-            ->willReturn(1)
-        ;
-
-        $this->cache->expects(self::once())
-            ->method('set')
-            ->with('doctrine_session_'.$sessionId, $sessionData, 3600)
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        $sessionId = 'new_session_'.uniqid();
+        $sessionData = 'new_session_data';
 
         // Act
         $result = $this->repository->write($sessionId, $sessionData);
 
         // Assert
         $this->assertTrue($result);
+
+        // 验证数据已写入数据库
+        $dbData = $this->connection->fetchOne(
+            'SELECT sess_data FROM sessions WHERE sess_id = ?',
+            [$sessionId]
+        );
+        $this->assertSame($sessionData, base64_decode($dbData, true));
+
+        // 验证数据已缓存
+        $cachedData = $this->cache->get('doctrine_session_'.$sessionId);
+        $this->assertSame($sessionData, $cachedData);
     }
 
     /**
-     * 测试写入会话数据 - 缓存更新失败.
+     * 测试写入会话数据 - 更新现有会话.
      */
-    public function testWriteShouldContinueWhenCacheUpdateFails(): void
+    public function testWriteShouldUpdateExistingSession(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
-        $sessionData = 'test_session_data';
+        $sessionId = 'existing_session_'.uniqid();
+        $oldData = 'old_data';
+        $newData = 'new_data';
 
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->willReturn($this->statement)
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeStatement')
-            ->willReturn(1)
-        ;
-
-        $this->cache->expects(self::once())
-            ->method('set')
-            ->willThrowException(new \Exception('Cache error'))
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        $this->insertTestSession($sessionId, $oldData, time());
 
         // Act
-        $result = $this->repository->write($sessionId, $sessionData);
+        $result = $this->repository->write($sessionId, $newData);
 
         // Assert
         $this->assertTrue($result);
+
+        // 验证数据已更新
+        $dbData = $this->connection->fetchOne(
+            'SELECT sess_data FROM sessions WHERE sess_id = ?',
+            [$sessionId]
+        );
+        $this->assertSame($newData, base64_decode($dbData, true));
     }
 
     /**
@@ -283,30 +267,37 @@ final class PdoSessionRepositoryTest extends TestCase
     public function testDestroyShouldDeleteSessionFromCacheAndDatabase(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
+        $sessionId = 'destroy_session_'.uniqid();
+        $sessionData = 'test_data';
 
-        $this->cache->expects(self::once())
-            ->method('delete')
-            ->with('doctrine_session_'.$sessionId)
-        ;
+        $this->insertTestSession($sessionId, $sessionData, time());
+        $this->cache->set('doctrine_session_'.$sessionId, $sessionData);
 
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('DELETE FROM sessions'))
-            ->willReturn($this->statement)
-        ;
+        // Act
+        $result = $this->repository->destroy($sessionId);
 
-        $this->statement->expects(self::once())
-            ->method('bindValue')
-            ->with(1, $sessionId)
-        ;
+        // Assert
+        $this->assertTrue($result);
 
-        $this->statement->expects(self::once())
-            ->method('executeStatement')
-            ->willReturn(1)
-        ;
+        // 验证数据库中已删除
+        $dbData = $this->connection->fetchOne(
+            'SELECT sess_data FROM sessions WHERE sess_id = ?',
+            [$sessionId]
+        );
+        $this->assertFalse($dbData);
 
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        // 验证缓存中已删除
+        $cachedData = $this->cache->get('doctrine_session_'.$sessionId);
+        $this->assertNull($cachedData);
+    }
+
+    /**
+     * 测试销毁会话 - 会话不存在.
+     */
+    public function testDestroyShouldReturnTrueForNonExistentSession(): void
+    {
+        // Arrange
+        $sessionId = 'non_existent_'.uniqid();
 
         // Act
         $result = $this->repository->destroy($sessionId);
@@ -316,65 +307,13 @@ final class PdoSessionRepositoryTest extends TestCase
     }
 
     /**
-     * 测试销毁会话 - 缓存删除失败.
+     * 测试检查会话是否存在 - 存在且未过期.
      */
-    public function testDestroyShouldContinueWhenCacheDeleteFails(): void
+    public function testExistsShouldReturnTrueForExistingSession(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
-
-        $this->cache->expects(self::once())
-            ->method('delete')
-            ->willThrowException(new \Exception('Cache error'))
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
-
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->willReturn($this->statement)
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeStatement')
-            ->willReturn(0) // 模拟没有删除任何记录
-        ;
-
-        // Act
-        $result = $this->repository->destroy($sessionId);
-
-        // Assert
-        $this->assertTrue($result);
-    }
-
-    /**
-     * 测试检查会话是否存在.
-     */
-    public function testExistsShouldCheckDatabaseForSessionExistence(): void
-    {
-        // Arrange
-        $sessionId = 'test_session_id';
-
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('SELECT 1 FROM sessions'))
-            ->willReturn($this->statement)
-        ;
-
-        // 简化 bindValue 验证
-        $this->statement->expects(self::exactly(2))
-            ->method('bindValue')
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
-
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn('1')
-        ;
+        $sessionId = 'existing_session_'.uniqid();
+        $this->insertTestSession($sessionId, 'test_data', time());
 
         // Act
         $result = $this->repository->exists($sessionId);
@@ -384,34 +323,49 @@ final class PdoSessionRepositoryTest extends TestCase
     }
 
     /**
+     * 测试检查会话是否存在 - 不存在.
+     */
+    public function testExistsShouldReturnFalseForNonExistentSession(): void
+    {
+        // Arrange
+        $sessionId = 'non_existent_'.uniqid();
+
+        // Act
+        $result = $this->repository->exists($sessionId);
+
+        // Assert
+        $this->assertFalse($result);
+    }
+
+    /**
+     * 测试检查会话是否存在 - 已过期.
+     */
+    public function testExistsShouldReturnFalseForExpiredSession(): void
+    {
+        // Arrange
+        $sessionId = 'expired_session_'.uniqid();
+        // 默认 TTL 是 86400 秒（24小时），必须超过这个时间才算过期
+        $expiredTime = time() - 86401; // 超过24小时前
+
+        $this->insertTestSession($sessionId, 'test_data', $expiredTime);
+
+        // Act
+        $result = $this->repository->exists($sessionId);
+
+        // Assert
+        $this->assertFalse($result);
+    }
+
+    /**
      * 测试获取会话最后修改时间.
      */
     public function testGetLastModifiedShouldReturnTimestamp(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
+        $sessionId = 'test_session_'.uniqid();
         $timestamp = time();
 
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('SELECT sess_time FROM sessions'))
-            ->willReturn($this->statement)
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('bindValue')
-            ->with(1, $sessionId)
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
-
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn($timestamp)
-        ;
+        $this->insertTestSession($sessionId, 'test_data', $timestamp);
 
         // Act
         $result = $this->repository->getLastModified($sessionId);
@@ -426,22 +380,7 @@ final class PdoSessionRepositoryTest extends TestCase
     public function testGetLastModifiedShouldReturnNullWhenSessionNotFound(): void
     {
         // Arrange
-        $sessionId = 'non_existent_session';
-
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->willReturn($this->statement)
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
-
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn(false)
-        ;
+        $sessionId = 'non_existent_'.uniqid();
 
         // Act
         $result = $this->repository->getLastModified($sessionId);
@@ -451,39 +390,62 @@ final class PdoSessionRepositoryTest extends TestCase
     }
 
     /**
-     * 测试垃圾回收.
+     * 测试垃圾回收 - 删除过期会话.
      */
     public function testGcShouldDeleteExpiredSessions(): void
     {
         // Arrange
         $maxLifetime = 3600;
-        $deletedCount = 5;
 
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('DELETE FROM sessions WHERE sess_time'))
-            ->willReturn($this->statement)
-        ;
+        // 插入过期会话
+        $expiredSession1 = 'expired_1_'.uniqid();
+        $expiredSession2 = 'expired_2_'.uniqid();
+        $this->insertTestSession($expiredSession1, 'data1', time() - $maxLifetime - 100);
+        $this->insertTestSession($expiredSession2, 'data2', time() - $maxLifetime - 200);
 
-        $this->statement->expects(self::once())
-            ->method('bindValue')
-            ->with(1, self::callback(function ($value) {
-                return is_int($value) && $value > 0;
-            }))
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeStatement')
-            ->willReturn($deletedCount)
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        // 插入未过期会话
+        $validSession = 'valid_'.uniqid();
+        $this->insertTestSession($validSession, 'data3', time());
 
         // Act
-        $result = $this->repository->gc($maxLifetime);
+        $deletedCount = $this->repository->gc($maxLifetime);
 
         // Assert
-        $this->assertSame($deletedCount, $result);
+        $this->assertSame(2, $deletedCount);
+
+        // 验证过期会话已删除
+        $count = $this->connection->fetchOne('SELECT COUNT(*) FROM sessions');
+        $this->assertEquals(1, $count);
+
+        // 验证未过期会话仍存在
+        $validData = $this->connection->fetchOne(
+            'SELECT sess_data FROM sessions WHERE sess_id = ?',
+            [$validSession]
+        );
+        $this->assertNotFalse($validData);
+    }
+
+    /**
+     * 测试垃圾回收 - 没有过期会话.
+     */
+    public function testGcShouldReturnZeroWhenNoExpiredSessions(): void
+    {
+        // Arrange
+        $maxLifetime = 3600;
+
+        // 插入未过期会话
+        $validSession = 'valid_'.uniqid();
+        $this->insertTestSession($validSession, 'data', time());
+
+        // Act
+        $deletedCount = $this->repository->gc($maxLifetime);
+
+        // Assert
+        $this->assertSame(0, $deletedCount);
+
+        // 验证会话仍存在
+        $count = $this->connection->fetchOne('SELECT COUNT(*) FROM sessions');
+        $this->assertEquals(1, $count);
     }
 
     /**
@@ -495,113 +457,104 @@ final class PdoSessionRepositoryTest extends TestCase
         $result = $this->repository->getConnection();
 
         // Assert
+        $this->assertInstanceOf(Connection::class, $result);
         $this->assertSame($this->connection, $result);
     }
 
     /**
-     * 测试构造函数的默认参数.
+     * 测试缓存前缀行为 - 通过验证缓存键来测试.
+     *
+     * 这个测试验证 repository 使用正确的缓存前缀 'doctrine_session_'，
+     * 通过观察缓存中键的格式来验证，而不是使用反射访问私有常量。
      */
-    public function testConstructorShouldUseDefaultParameters(): void
-    {
-        // Assert - 验证默认参数通过测试行为体现
-        $this->assertInstanceOf(PdoSessionRepository::class, $this->repository);
-    }
-
-    /**
-     * 测试缓存前缀行为 - 通过验证缓存键的生成来测试.
-     */
-    public function testCachePrefixBehaviorShouldUseCorrectPrefix(): void
+    public function testRepositoryCachePrefixBehaviorShouldBeCorrect(): void
     {
         // Arrange
-        $sessionId = 'test_session_id';
-        $expectedCacheKey = 'doctrine_session_'.$sessionId;
+        $sessionId = 'test_prefix_'.uniqid();
+        $sessionData = 'test_data';
 
-        // 通过验证 cache->get() 调用的键来测试前缀行为
-        $this->cache->expects(self::once())
-            ->method('get')
-            ->with($expectedCacheKey)
-            ->willReturn(null)
-        ;
+        // Act - 写入会话数据，这会同时更新缓存
+        $this->repository->write($sessionId, $sessionData);
 
-        // 模拟数据库返回空
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->willReturn($this->statement)
-        ;
+        // Assert - 验证缓存键使用了正确的前缀
+        $cachedData = $this->cache->get('doctrine_session_'.$sessionId);
+        $this->assertSame($sessionData, $cachedData);
 
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
-
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn(false)
-        ;
-
-        // Act - 调用 read 方法触发缓存行为
-        $this->repository->read($sessionId);
-
-        // Assert - 通过 mock 期望验证缓存键使用了正确的前缀
-        // 如果前缀不正确，mock 期望会失败
+        // 验证不带前缀的键不存在
+        $this->assertNull($this->cache->get($sessionId));
     }
 
     /**
      * 测试查找存在的会话ID应该返回会话数据.
      *
-     * 此测试用例验证当会话存在时，repository 能正确返回会话数据。
-     * 对应于 AbstractRepositoryTestCase 中 testFindWithExistingIdShouldReturnEntity 的语义，
+     * 此测试用例验证当会话存在时,repository 能正确返回会话数据。
+     * 对应于 AbstractRepositoryTestCase 中 testFindWithExistingIdShouldReturnEntity 的语义,
      * 但适配了 PdoSessionRepository 的 read 方法而非标准的 find 方法。
      */
     public function testFindWithExistingIdShouldReturnEntity(): void
     {
         // Arrange
-        $sessionId = 'existing_session_id';
+        $sessionId = 'existing_session_id_'.uniqid();
         $sessionData = 'existing_session_data';
-        $encodedData = base64_encode($sessionData);
 
-        // 模拟缓存不存在数据
-        $this->cache->expects(self::once())
-            ->method('get')
-            ->with('doctrine_session_'.$sessionId)
-            ->willReturn(null)
-        ;
-
-        // 模拟数据库返回存在的会话数据
-        $this->connection->expects(self::once())
-            ->method('prepare')
-            ->with(self::stringContains('SELECT sess_data FROM sessions'))
-            ->willReturn($this->statement)
-        ;
-
-        // 验证绑定的参数：sessionId 和 time threshold
-        $this->statement->expects(self::exactly(2))
-            ->method('bindValue')
-        ;
-
-        $this->statement->expects(self::once())
-            ->method('executeQuery')
-            ->willReturn($this->result)
-        ;
-
-        // 数据库返回 base64 编码的数据
-        $this->result->expects(self::once())
-            ->method('fetchOne')
-            ->willReturn($encodedData)
-        ;
-
-        // 验证数据被缓存
-        $this->cache->expects(self::once())
-            ->method('set')
-            ->with('doctrine_session_'.$sessionId, $sessionData, 3600)
-        ;
-
-        // 注意：logger 的行为不再验证（使用真实 logger）
+        $this->insertTestSession($sessionId, $sessionData, time());
 
         // Act
         $result = $this->repository->read($sessionId);
 
-        // Assert - 验证返回正确的会话数据（解码后的）
+        // Assert - 验证返回正确的会话数据
         $this->assertSame($sessionData, $result);
+    }
+
+    /**
+     * 测试写入操作同时更新缓存和数据库.
+     */
+    public function testWriteShouldUpdateBothCacheAndDatabase(): void
+    {
+        // Arrange
+        $sessionId = 'test_session_'.uniqid();
+        $sessionData = 'test_data';
+
+        // Act
+        $result = $this->repository->write($sessionId, $sessionData);
+
+        // Assert
+        $this->assertTrue($result);
+
+        // 验证缓存
+        $cachedData = $this->cache->get('doctrine_session_'.$sessionId);
+        $this->assertSame($sessionData, $cachedData);
+
+        // 验证数据库
+        $dbData = $this->connection->fetchOne(
+            'SELECT sess_data FROM sessions WHERE sess_id = ?',
+            [$sessionId]
+        );
+        $this->assertSame($sessionData, base64_decode($dbData, true));
+    }
+
+    /**
+     * 测试读取操作会缓存数据库结果.
+     */
+    public function testReadShouldCacheDatabaseResult(): void
+    {
+        // Arrange
+        $sessionId = 'test_session_'.uniqid();
+        $sessionData = 'test_data';
+
+        $this->insertTestSession($sessionId, $sessionData, time());
+
+        // 确保缓存中没有数据
+        $this->cache->delete('doctrine_session_'.$sessionId);
+
+        // Act - 第一次读取应该从数据库读取并缓存
+        $result = $this->repository->read($sessionId);
+
+        // Assert
+        $this->assertSame($sessionData, $result);
+
+        // 验证已缓存
+        $cachedData = $this->cache->get('doctrine_session_'.$sessionId);
+        $this->assertSame($sessionData, $cachedData);
     }
 }

@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Tourze\DoctrineSessionBundle\EventSubscriber;
 
 use Doctrine\ORM\Tools\Event\GenerateSchemaEventArgs;
@@ -8,7 +10,7 @@ use Symfony\Component\DependencyInjection\Attribute\AutoconfigureTag;
 use Tourze\DoctrineSessionBundle\Service\PdoSessionHandler;
 
 #[AutoconfigureTag(name: 'doctrine.event_listener', attributes: ['event' => 'postGenerateSchema'])]
-class PdoSessionHandlerSchemaListener extends AbstractSchemaListener
+final class PdoSessionHandlerSchemaListener extends AbstractSchemaListener
 {
     public function __construct(private readonly PdoSessionHandler $sessionHandler)
     {

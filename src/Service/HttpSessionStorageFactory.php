@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Tourze\DoctrineSessionBundle\Service;
 
 use Monolog\Attribute\WithMonologChannel;
@@ -15,7 +17,7 @@ use Tourze\DoctrineSessionBundle\Storage\HttpSessionStorage;
 
 #[WithMonologChannel(channel: 'doctrine_session')]
 #[Autoconfigure(public: true)]
-class HttpSessionStorageFactory implements SessionStorageFactoryInterface
+final class HttpSessionStorageFactory implements SessionStorageFactoryInterface
 {
     private MetadataBag $metaBag;
 

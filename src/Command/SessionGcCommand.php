@@ -16,7 +16,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
     name: self::NAME,
     description: '清理过期的 session 记录',
 )]
-class SessionGcCommand extends Command
+final class SessionGcCommand extends Command
 {
     private const NAME = 'doctrine:session:gc';
 

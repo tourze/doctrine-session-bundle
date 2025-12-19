@@ -16,7 +16,7 @@ use Tourze\DoctrineSessionBundle\Storage\SessionRepositoryInterface;
  * 基于 Request 对象进行会话管理，自动处理 sessionId 的提取和生成
  */
 #[WithMonologChannel(channel: 'doctrine_session')]
-class RequestSessionManager implements SessionManagerInterface
+final class RequestSessionManager implements SessionManagerInterface
 {
     public function __construct(
         private readonly SessionRepositoryInterface $repository,

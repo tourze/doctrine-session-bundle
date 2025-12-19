@@ -4,12 +4,11 @@ parameters:
   default_session_name: 'PHPSESSID'
 
 services:
-  # default configuration for services in *this* file
   _defaults:
-    autowire: true      # Automatically injects dependencies in your services.
-    autoconfigure: true # Automatically registers your services as commands, event subscribers, etc.
+    autowire: true
+    autoconfigure: true
+    public: false
 
-  # 为PdoSessionHandler提供CacheInterface依赖
   Psr\SimpleCache\CacheInterface:
     class: Symfony\Component\Cache\Psr16Cache
     arguments:
@@ -26,9 +25,6 @@ services:
   Tourze\DoctrineSessionBundle\Manager\:
     resource: '../../Manager/'
 
-  # 新的分层架构服务定义
-  
-  # 底层数据仓库服务
   Tourze\DoctrineSessionBundle\Storage\SessionRepositoryInterface:
     class: Tourze\DoctrineSessionBundle\Storage\PdoSessionRepository
     public: true
@@ -39,7 +35,6 @@ services:
       - '%doctrine_session_table_name%'
       - '%doctrine_session_ttl%'
 
-  # Request-based 会话管理器
   Tourze\DoctrineSessionBundle\Manager\SessionManagerInterface:
     class: Tourze\DoctrineSessionBundle\Manager\RequestSessionManager
     public: true
@@ -47,24 +42,19 @@ services:
       - '@Tourze\DoctrineSessionBundle\Storage\SessionRepositoryInterface'
       - '@logger'
 
-  # PDO Session Handler (PHP接口适配层)
   Tourze\DoctrineSessionBundle\Service\PdoSessionHandler:
     arguments:
       - '@Tourze\DoctrineSessionBundle\Storage\SessionRepositoryInterface'
       - '@logger'
       - '%doctrine_session_ttl%'
-  
-  # HttpSessionStorage 需要显式配置 sessionName 参数
+
   Tourze\DoctrineSessionBundle\Storage\HttpSessionStorage:
     arguments:
       $sessionName: '%env(resolve:default:default_session_name:DOCTRINE_SESSION_NAME)%'
 
-  # HttpSessionFactory 完整配置所有参数
   Tourze\DoctrineSessionBundle\Service\HttpSessionFactory:
     arguments:
       $logger: '@logger'
       $sessionHandler: '@Tourze\DoctrineSessionBundle\Service\PdoSessionHandler'
       $sessionName: 'PHPSESSID'
       $requestStack: '@request_stack'
-
-  # session.factory 服务将通过 OverrideSessionFactoryPass 动态替换

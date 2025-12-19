@@ -20,7 +20,7 @@ use Psr\SimpleCache\CacheInterface;
  * 负责会话数据的数据库 CRUD 操作，包括缓存优化
  */
 #[WithMonologChannel(channel: 'doctrine_session')]
-class PdoSessionRepository implements SessionRepositoryInterface
+final class PdoSessionRepository implements SessionRepositoryInterface
 {
     private const CACHE_PREFIX = 'doctrine_session_';
 

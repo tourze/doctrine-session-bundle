@@ -17,7 +17,7 @@ use Tourze\DoctrineSessionBundle\Storage\HttpSessionStorage;
 
 #[WithMonologChannel(channel: 'doctrine_session')]
 #[Autoconfigure(public: true)]
-class HttpSessionFactory implements SessionFactoryInterface, ResetInterface
+final class HttpSessionFactory implements SessionFactoryInterface, ResetInterface
 {
     /**
      * 基于请求对象的弱引用缓存，避免内存泄漏.

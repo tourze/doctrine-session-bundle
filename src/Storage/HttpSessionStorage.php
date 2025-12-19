@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Tourze\DoctrineSessionBundle\Storage;
 
 use Monolog\Attribute\WithMonologChannel;
@@ -16,7 +18,7 @@ use Tourze\DoctrineSessionBundle\Service\PdoSessionHandler;
 
 #[WithMonologChannel(channel: 'doctrine_session')]
 #[Autoconfigure(public: true)]
-class HttpSessionStorage implements SessionStorageInterface
+final class HttpSessionStorage implements SessionStorageInterface
 {
     /**
      * @var SessionBagInterface[]

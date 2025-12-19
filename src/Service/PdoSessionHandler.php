@@ -19,7 +19,7 @@ use Tourze\DoctrineSessionBundle\Storage\SessionRepositoryInterface;
  * 底层使用 SessionRepositoryInterface 进行数据操作
  */
 #[WithMonologChannel(channel: 'doctrine_session')]
-class PdoSessionHandler implements \SessionHandlerInterface
+final class PdoSessionHandler implements \SessionHandlerInterface
 {
     private bool $gcCalled = false;
 
